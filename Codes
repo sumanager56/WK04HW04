@@ -1,0 +1,386 @@
+url="https://raw.githubusercontent.com/vtdrfuka/BSE5304_2022/main/Lab04.R"
+download.file(url,"Lab04.R")
+options(repos ="http://cran.us.r-project.org")  # required to get latest libs
+# Installing the packages we will play with today
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(elevatr,soilDB,rgdal,raster)
+# From previous weeks
+pacman::p_load(EcoHydRology,rnoaa,curl,httr)
+#other libraries
+library(patchwork)
+library(ggplot2)
+rm(list=objects())
+setwd("~")
+#dir.create("~/Lab04")
+setwd("~/Lab04/")
+#Functions
+source("https://raw.githubusercontent.com/vtdrfuka/BSE5304_2022/main/functions/TMWBmodel.R")
+TMWBmodel_suman <- function(TMWB=TMWB,dPval=0,fcres=.1,SFTmp=-1,bmlt6=2.5,bmlt12=1,Tlag=.5,AWCval=50,Slope=0){
+  # Now complete the model… what flows from TopSlope to MidSlope, and down to 
+  # BotSlope. How will these be connected?
+  
+  # notice that there is an Energy Balance based Snow Accumulation 
+  # and Melt model in the EcoHydRology package.
+  attach(TMWB)
+  SNO_Energy=SnowMelt(date, P, MaxTemp-3, MinTemp-3, myflowgage$declat, 
+                      slope = Slope, aspect = 0, tempHt = 1, windHt = 2, groundAlbedo = 0.25,
+                      SurfEmissiv = 0.95, windSp = 2, forest = 0, startingSnowDepth_m = 0,
+                      startingSnowDensity_kg_m3=450)
+  # Note that the -3 in the above 
+  detach(TMWB)
+  TMWB$SNO=SNO_Energy$SnowWaterEq_mm
+  TMWB$SNOmlt=SNO_Energy$SnowMelt_mm
+  attach(TMWB)
+  TMWB$Albedo=.23
+  TMWB$Albedo[TMWB$SNO>0]=.95
+  PET=PET_fromTemp(Jday=(1+as.POSIXlt(date)$yday),Tmax_C = MaxTemp,Tmin_C = MinTemp,lat_radians = myflowgage$declat*pi/180) * 1000
+  TMWB$PET=PET
+  detach(TMWB)
+  # add in rm
+  rm(list=c("PET"))
+  
+  
+  #TMWB$AWC=(0.45-0.15)*1000 #Fld Cap = .45, Wilt Pt = .15, z=1000mm
+  TMWB$AWC=AWCval
+  # Oh, this we want to vary some of these around our watershed!
+  TMWB$dP = 0 # Initializing Net Precipitation
+  TMWB$ET = 0 # Initializing ET
+  TMWB$AW = 0 # Initializing AW
+  TMWB$Excess = 0 # Initializing Excess
+  TMWB$dPval = dPval # Initializing excess of upper slopes as ppt input
+  
+  # Loop to calculate AW and Excess
+  attach(TMWB)
+  for (t in 2:length(AW)){
+    # This is where ET and Net Precipitation is now calculated
+    ET[t] = min (AW[t-1],PET[t])
+    ET[t] = (AW[t-1]/AWC[t-1])*PET[t] # New Model
+    if(AvgTemp[t] >= SFTmp){
+      dP[t] = P[t] + dPval[t] - ET[t] + SNOmlt[t]
+    }  else {
+      dP[t] = ET[t] +dPval[t]
+    }
+    # From here onward, everything is the same as Week2’s lab
+    if (dP[t]<=0) {
+      values<-soildrying(AW[t-1],dP[t],AWC[t])
+    } else if((dP[t]>0) & (AW[t-1]+dP[t])<=AWC[t]) {
+      values<-soilwetting(AW[t-1],dP[t],AWC[t])
+    } else {
+      values<-soil_wetting_above_capacity(AW[t-1],dP[t],AWC[t])
+    }
+    AW[t]<-values[1]
+    Excess[t]<-values[2]
+  }
+  TMWB$AW=AW
+  TMWB$Excess=Excess
+  # TMWB$dP=Excess  # This was in error originally
+  TMWB$dP=dP
+  TMWB$ET=ET
+  detach(TMWB) # IMPORTANT TO DETACH
+  rm(list=c("AW","dP","ET"))
+  
+  TMWB$Qpred=NA
+  TMWB$Qpred[1]=0
+  TMWB$S=NA
+  TMWB$S[1]=0
+  attach(TMWB)
+  #fcres=.3        # Oh, this we want to vary in different areas
+  for (t in 2:length(Qpred)){
+    S[t]=S[t-1]+Excess[t]     
+    Qpred[t]=fcres*S[t]
+    S[t]=S[t]-Qpred[t]
+  }
+  TMWB$S=S
+  TMWB$Qpred=Qpred # UPDATE vector BEFORE DETACHING
+  detach(TMWB) # IMPORTANT TO DETACH
+  rm(list=c("S","Qpred"))
+  return(TMWB)
+}
+#wss_aoi_2022-02-15_21-30-55.zip
+# Downloading soil dataset for basin near Fircrest, WA. flow gage id-12091200
+url="https://websoilsurvey.sc.egov.usda.gov/DSD/Download/AOI/bx00piaomyh0ggzomrwgtnp2/wss_aoi_2022-02-15_21-37-50.zip"
+download.file(url,"mysoil.zip")
+unzip("mysoil.zip")
+# using the function to get data from USGS 12091200
+myflowgage_id="12091200"
+myflowgage=get_usgs_gage(myflowgage_id,begin_date = "2016-01-01",end_date = "2022-02-01")
+
+# Converting flow to mm/day for the basin
+myflowgage$flowdata$Qmm = myflowgage$flowdata$flow/myflowgage$area/10^3
+
+#Let's look at stream
+url="https://prd-tnm.s3.amazonaws.com/StagedProducts/Hydrography/NHD/HU8/HighResolution/Shape/NHD_H_17110019_HU8_Shape.zip"
+download.file(url,"NHD_H_17110019_HU8_Shape.zip")
+unzip("NHD_H_17110019_HU8_Shape.zip",exdir="17110019")
+# Take a quick look at what is included in the NHD dataset
+list.files("17110019/Shape/",pattern = "dbf")
+
+streams=readOGR("17110019/Shape/NHDFlowline.dbf")
+plot(streams)
+mystream=subset(streams,gnis_name=="Leach Creek")
+lines(mystream,col="red")
+
+mystream=subset(streams,gnis_id=="01506118")
+plot(mystream,col="red")
+#dev.off()
+
+c(mystream@bbox)
+# What is this returning? Why do we care?
+mybbox=c(mystream@bbox)
+# This needs to be completed based on your download
+mysoil=readOGR("wss_aoi_2022-02-15_21-37-50/spatial/soilmu_a_aoi.shp")    
+# Explore the mysoil dataset which is returned
+head(mysoil@data)
+class(mysoil)
+
+unique(mysoil$MUKEY) #gives how many unique soils I have
+
+#Exploring the downloaded soil data
+#mysoil=readOGR("wss_aoi_2022-02-11_09-31-24/spatial/soilmu_a_aoi.shp") 
+mybbox=c(mysoil@bbox)
+# First associate mukey with cokey from component
+mysoil$mukey=mysoil$MUKEY  # or rename the column
+mukey_statement = format_SQL_in_statement(unique(mysoil$mukey))
+print(mukey_statement)
+q_mu2co = paste("SELECT mukey,cokey FROM component WHERE mukey IN ", mukey_statement, sep="")
+print(q_mu2co)
+mu2co = SDA_query(q_mu2co)
+# Second associate cokey with ksat_r,awc_r,hzdepb_r from chorizon
+cokey_statement = format_SQL_in_statement(unique(mu2co$cokey))
+q_co2ch = paste("SELECT cokey, resdept_r  FROM corestrictions WHERE cokey IN ", cokey_statement, sep="")
+print(q_co2ch)
+co2ch = SDA_query(q_co2ch)
+
+summary(mu2ch)
+#mu2chmax=aggregate(mu2ch,list(mu2ch$mukey),max)
+write.csv(mu2ch,"Restricting depth.csv") 
+#Elevation  
+proj4_ll = "+proj=longlat"
+proj4string(mysoil) = proj4_ll
+
+mydem=get_elev_raster(locations=mysoil, 
+                      z = 11, prj =proj4string(mysoil) ,
+                      src ="aws",clip="bbox",expand = 0.001)
+plot(mydem)
+points(mysoil,col="black")
+lines(mystream,col="red")
+class(mydem)
+mydem@crs
+mydem@ncols
+res(mydem) 
+class(mu2ch)
+
+# Can you figure out the resolution in meters? 
+summary(terrain(mydem, opt='slope',unit = "degrees"))
+# What is this 'slope'? Use the man page for the terrain() function to answer
+plot(terrain(mydem, opt='TPI',unit = "degrees"))
+# What is this 'TPI'? 
+summary(terrain(mydem, opt='TRI',unit = "degrees"))
+plot(terrain(mydem, opt='TRI',unit = "degrees"),
+     main="Stream segment plotted over the Elevation map",xlab="longitude",ylab="latitude")
+lines(mystream,col="red")
+
+
+#HOMEWORK 2
+stns=meteo_distance(
+  station_data=ghcnd_stations(),
+  lat=myflowgage$declat,
+  long=myflowgage$declon,
+  units = "deg",
+  radius = 30,
+  limit = NULL
+)
+# We are looking for stations with elements that have PRCP, TMAX and TMIN 
+# and current data (i.e. Year 2021). 
+WXStn=stns[stns$element=="TMAX"&stns$last_year>=2021,]$id[1]
+WXData=meteo_pull_monitors(
+  monitors=WXStn,
+  keep_flags = FALSE,
+  date_min = "2016-01-01",
+  date_max = NULL,
+  var = c("TMAX","TMIN","PRCP") 
+)
+summary(WXData)  #
+plot(WXData$date,WXData$prcp)
+
+# Create an aligned modeldata data frame to build our model in
+modeldata=merge(WXData,myflowgage$flowdata,by.x="date",by.y="mdate")
+summary(modeldata)  #
+modeldata$MaxTemp=modeldata$tmax/10 # Converting to C
+modeldata$MinTemp=modeldata$tmin/10 # Converting to C
+modeldata$P=modeldata$prcp/10 # Converting to mm
+# View(modeldata)  
+# Compare your precipitation to the flow out of your basin
+modeldata$P[is.na(modeldata$P)]=0
+modeldata$MinTemp[is.na(modeldata$MinTemp)]=0
+modeldata$MaxTemp[is.na(modeldata$MaxTemp)]=
+  modeldata$MinTemp[is.na(modeldata$MaxTemp)] +1
+modeldata$MaxTemp[modeldata$MaxTemp<=modeldata$MinTemp]=
+  modeldata$MinTemp[modeldata$MaxTemp<=modeldata$MinTemp]+1
+modeldata$AvgTemp=(modeldata$MaxTemp+modeldata$MaxTemp)/2.0
+
+summary(modeldata)
+modeldata[is.na(modeldata)]=0 # A Quick BUT sloppy removal of NAs
+TMWB=modeldata
+# Last weeks homework example
+
+# Calibrating the parameters one at a time
+for (fcres in seq(.1,.5,.1)){
+  TMWBnew=TMWBmodel(TMWB=TMWB,fcres=fcres)
+  print(paste(fcres,NSE(TMWBnew$Qmm,TMWBnew$Qpred)))
+}
+# fcres=.1 is the highest NSE
+for (SFTmp in seq(-5,20)){
+  TMWBnew=TMWBmodel(TMWB=TMWB,fcres=.1,SFTmp = SFTmp)
+  print(paste(SFTmp,NSE(TMWBnew$Qmm,TMWBnew$Qpred)))
+}
+# SFTMP=-1 is the highest NSE
+for(AWCval in seq(50,350,50)){
+  TMWBnew=TMWBmodel(TMWB=TMWB,fcres=.1,SFTmp = -1,Tlag = .5,AWCval = AWCval)
+  print(paste(AWCval,NSE(TMWBnew$Qmm,TMWBnew$Qpred)))
+}#AWC = 50 for best NSE
+
+#Homework1- using fcres=.1, SFTmp = -1, and AWCval = 50
+TopSlope=TMWBmodel(TMWB=TMWB,fcres=.1,SFTmp=-1,AWCval=50,Slope=0)
+
+#Adding excess of topslope to ppt of midslope in TMWBmodel_suman function
+MidSlope=TMWBmodel_suman(TMWB=TMWB,dPval=TopSlope$Excess)
+#Adding excess of midslope to ppt of bottomslope in TMWBmodel_suman function
+BotSlope=TMWBmodel_suman(TMWB=TMWB,dPval=MidSlope$Excess)
+
+#Let's select data columns to plot
+Top_AW <- TopSlope$AW
+Mid_AW <- MidSlope$AW
+Bot_AW <- BotSlope$AW
+
+Top_EX <- TopSlope$Excess
+Mid_EX <- MidSlope$Excess
+Bot_EX <- BotSlope$Excess
+
+#Plotting excesses over time ###We will plot below using ggplot
+myYlim <- max(c(Top_EX,Mid_EX,Bot_EX))
+Date <- TopSlope$date
+ColorPalette <- colorRampPalette(c('red','orange','green','blue','purple'))
+plot.colors<-ColorPalette(5)
+plot(Date,Top_EX,type="l",ylim=c(0,myYlim),col=plot.colors[3],main= "Excess moisture at different topo locations",
+     xlab="Date",ylab="Excess",)
+lines(Date,Mid_EX,col=plot.colors[1])
+lines(Date,Bot_EX,col=plot.colors[4])
+legend("topright",                                 
+       legend = c("Top_slope", "Mid_slope", "Bot_slope"),
+       col = c("green", "red", "blue"),
+       lty = 1,cex=0.8)
+
+#Plotting AW's over time
+Date <- TopSlope$date
+plot(Date,Top_AW,type="l",col=plot.colors[3],main= "Available moisture at different topo locations",
+     xlab="Date",ylab="Available water content")
+lines(Date,Mid_AW,col=plot.colors[1])
+lines(Date,Bot_AW,col=plot.colors[4])
+legend("topright",                                 
+       legend = c("Top_slope", "Mid_slope", "Bot_slope"),
+       col = c("green", "red", "blue"),
+       lty = 1,cex=0.8)
+#dev.off()
+
+#plotting using ggplot
+p1<- ggplot() +
+  # Plot your discharge data
+  geom_line(aes(x=Date, y = Top_EX), color="magenta",size=0.5)+
+  xlab("") +
+  ylab("")+
+  ggtitle("TopSlope")+
+  theme(
+    plot.title = element_text(size=12, face="bold"),
+    axis.title.y = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.text.y = element_text(size=11, face="bold"),
+    axis.line.x = element_line(color="black",size=0.3),
+    axis.line.y = element_line(color="black",size=0.3),
+    panel.border = element_rect(color="black",fill=NA,size=0.3)
+  )
+
+p2<- ggplot() +
+  geom_line(aes(x=Date, y = Mid_EX), color="magenta",size=0.5)+
+  xlab("")+
+  ylab("Excess moisture")+
+  ggtitle("MidSlope")+
+  theme(
+    plot.title = element_text(size=12, face="bold"),
+    axis.title.y = element_text(size=11, color="black",face="bold"),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.text.y = element_text(size=11, face="bold"),
+    axis.line.x = element_line(color="black",size=0.3),
+    axis.line.y = element_line(color="black",size=0.3),
+    panel.border = element_rect(color="black",fill=NA,size=0.3)
+  )
+p3<- ggplot() +
+  geom_line(aes(x=Date, y = Bot_EX), color="magenta",size=0.5)+
+  xlab("Date")+
+  ylab("")+
+  ggtitle("BotSlope")+
+  theme(
+    plot.title = element_text(size=12, face="bold"),
+    axis.text.x = element_text(size=12,face="bold"),
+    axis.title.y = element_text(size=11, color="black",face="bold"),
+    axis.ticks.x = element_blank(),
+    axis.text.y = element_text(size=12, face="bold"),
+    axis.line.x = element_line(color="black",size=0.3),
+    axis.line.y = element_line(color="black",size=0.3),
+    panel.border = element_rect(color="black",fill=NA,size=0.3)
+  )
+#dev.off()
+p1 + p2 + p3 + plot_layout(nrow = 3) 
+
+#plotting using ggplot (AW's)
+p1<- ggplot() +
+  # Plot your discharge data
+  geom_line(aes(x=Date, y = Top_AW), color="magenta",size=0.5)+
+  xlab("") +
+  ylab("")+
+  ggtitle("TopSlope")+
+  theme(
+    plot.title = element_text(size=12, face="bold"),
+    axis.title.y = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.text.y = element_text(size=11, face="bold"),
+    axis.line.x = element_line(color="black",size=0.3),
+    axis.line.y = element_line(color="black",size=0.3),
+    panel.border = element_rect(color="black",fill=NA,size=0.3)
+  )
+
+p2<- ggplot() +
+  geom_line(aes(x=Date, y = Mid_AW), color="magenta",size=0.5)+
+  xlab("")+
+  ylab("Available moisture")+
+  ggtitle("MidSlope")+
+  theme(
+    plot.title = element_text(size=12, face="bold"),
+    axis.title.y = element_text(size=11, color="black",face="bold"),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.text.y = element_text(size=11, face="bold"),
+    axis.line.x = element_line(color="black",size=0.3),
+    axis.line.y = element_line(color="black",size=0.3),
+    panel.border = element_rect(color="black",fill=NA,size=0.3)
+  )
+p3<- ggplot() +
+  geom_line(aes(x=Date, y = Bot_AW), color="magenta",size=0.5)+
+  xlab("Date")+
+  ylab("")+
+  ggtitle("BotSlope")+
+  theme(
+    plot.title = element_text(size=12, face="bold"),
+    axis.text.x = element_text(size=12,face="bold"),
+    axis.title.y = element_text(size=11, color="black",face="bold"),
+    axis.ticks.x = element_blank(),
+    axis.text.y = element_text(size=12, face="bold"),
+    axis.line.x = element_line(color="black",size=0.3),
+    axis.line.y = element_line(color="black",size=0.3),
+    panel.border = element_rect(color="black",fill=NA,size=0.3)
+  )
+#dev.off()
+p1 + p2 + p3 + plot_layout(nrow = 3) 
